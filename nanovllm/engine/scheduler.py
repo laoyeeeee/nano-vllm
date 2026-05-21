@@ -1,8 +1,17 @@
 from collections import deque
+from dataclasses import dataclass
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+
+
+@dataclass(slots=True)
+class TokenEvent:
+    seq_id: int
+    token_id: int
+    finished: bool
+    finish_reason: str | None = None
 
 
 class Scheduler:
@@ -68,7 +77,8 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool) -> list[TokenEvent]:
+        events = []
         for seq, token_id in zip(seqs, token_ids):
             if is_prefill:
                 seq.num_cached_tokens = min(seq.num_cached_tokens + seq.num_scheduled_tokens, seq.num_tokens)
@@ -78,7 +88,13 @@ class Scheduler:
             seq.append_token(token_id)
             seq.num_cached_tokens += 1
             seq.num_scheduled_tokens = 0
+            finished = False
+            finish_reason = None
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                finished = True
+                finish_reason = "eos" if not seq.ignore_eos and token_id == self.eos else "length"
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+            events.append(TokenEvent(seq.seq_id, token_id, finished, finish_reason))
+        return events

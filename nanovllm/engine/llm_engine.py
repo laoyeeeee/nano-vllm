@@ -1,5 +1,5 @@
 import atexit
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -10,6 +10,15 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+
+
+@dataclass(slots=True)
+class StreamOutput:
+    seq_id: int
+    token_id: int | None
+    text: str
+    finished: bool
+    finish_reason: str | None = None
 
 
 class LLMEngine:
@@ -50,9 +59,8 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        events = self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        return events, num_tokens
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -72,7 +80,7 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            events, num_tokens = self.step()
             if num_tokens > 0:
                 prefill_throughput = num_tokens / (perf_counter() - t)
             else:
@@ -81,10 +89,38 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
-                pbar.update(1)
+            for event in events:
+                outputs.setdefault(event.seq_id, []).append(event.token_id)
+                if event.finished:
+                    pbar.update(1)
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs
+
+    def generate_stream(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        decode_special_tokens: bool = False,
+    ):
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        for prompt, sp in zip(prompts, sampling_params):
+            self.add_request(prompt, sp)
+        while not self.is_finished():
+            events, _ = self.step()
+            for event in events:
+                text = ""
+                if event.token_id is not None:
+                    text = self.tokenizer.decode(
+                        [event.token_id],
+                        skip_special_tokens=not decode_special_tokens,
+                    )
+                yield StreamOutput(
+                    seq_id=event.seq_id,
+                    token_id=event.token_id,
+                    text=text,
+                    finished=event.finished,
+                    finish_reason=event.finish_reason,
+                )
